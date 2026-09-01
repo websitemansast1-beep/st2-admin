@@ -1130,13 +1130,34 @@ async function addPresentationByLink() {
   const dropboxRawUrl = !driveFileId ? normalizeDropboxLink_(link) : null;
 
   let driveUrl;
-  if (driveFileId) {
+  if (driveFileId && !hasEmbeddedVideo) {
+    // Try converting the pasted Drive file into a Google Slides copy
+    // first — that gives real next/previous slide navigation instead of
+    // a static file preview (see driveConvertToSlides in
+    // DriveUpload.gs). This needs the file to actually be shared with
+    // this platform's Google account (Anyone-with-the-link is enough)
+    // and the Advanced Drive API enabled on the Apps Script project —
+    // if either isn't true, or the conversion fails for any other
+    // reason, this falls back to the plain file preview automatically;
+    // the presentation still gets added either way.
+    driveUrl = 'https://drive.google.com/file/d/' + driveFileId + '/preview'; // fallback default
+    toast('⏳ جاري تجهيز العرض...');
+    try {
+      const conv = await api('/presentations/convert-slides', {
+        method: 'POST',
+        body: JSON.stringify({ fileId: driveFileId })
+      });
+      if (conv && conv.ok && conv.data && conv.data.slidesEmbedUrl) {
+        driveUrl = conv.data.slidesEmbedUrl;
+      }
+    } catch (e) {
+      // network/auth error — keep the plain-preview fallback above
+    }
+  } else if (driveFileId && hasEmbeddedVideo) {
     // NOTE: Office Viewer only works here for files small enough that Drive
     // serves them without its "can't scan this file, too big" warning page
     // (roughly under ~25MB) — above that, use the Dropbox branch instead.
-    driveUrl = hasEmbeddedVideo
-      ? officeViewerEmbed_('https://drive.google.com/uc?export=download&id=' + driveFileId)
-      : 'https://drive.google.com/file/d/' + driveFileId + '/preview';
+    driveUrl = officeViewerEmbed_('https://drive.google.com/uc?export=download&id=' + driveFileId);
   } else if (dropboxRawUrl) {
     // Dropbox has no Drive-style size cutoff on direct file links (free
     // tier, up to its storage quota) — the free option for a big
