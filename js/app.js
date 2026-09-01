@@ -15,6 +15,40 @@ function toast(msg) {
   setTimeout(() => { t.classList.remove('on'); setTimeout(() => t.remove(), 400); }, 3000);
 }
 
+// ===== Global click rate-limiter =====
+// Blocks a SECOND click on the same button/link within a short cooldown
+// window, site-wide, for every page. This is separate from — and a
+// backstop for — withButtonLock/withRequestLock above: those only
+// protect the specific actions someone remembered to wrap. This catches
+// everything else (plain onclick="..." handlers scattered across the
+// admin panel: publish/hide/delete buttons, tab switches, etc.) without
+// having to touch every single one of them individually.
+//
+// How it works: a single listener on document, in the CAPTURE phase (so
+// it runs before the target element's own onclick), tracks the last time
+// each element was clicked in a WeakMap. A second click on the SAME
+// element inside the cooldown window is stopped before it ever reaches
+// that element's own handler — e.stopPropagation() during capture means
+// the event never continues down to the target at all. Clicking a
+// DIFFERENT button right after is unaffected, since the cooldown is
+// tracked per-element, not globally.
+(function setupMfxClickRateLimiter() {
+  const COOLDOWN_MS = 700;
+  const lastClickAt = new WeakMap();
+  document.addEventListener('click', function (e) {
+    const el = e.target.closest('button, .btn, [onclick]');
+    if (!el) return;
+    const now = Date.now();
+    const last = lastClickAt.get(el) || 0;
+    if (now - last < COOLDOWN_MS) {
+      e.stopPropagation();
+      e.preventDefault();
+      return;
+    }
+    lastClickAt.set(el, now);
+  }, true);
+})();
+
 function getToken() { return localStorage.getItem('mfx_admin_token'); }
 function setToken(t) { localStorage.setItem('mfx_admin_token', t); }
 function getRefreshToken() { return localStorage.getItem('mfx_admin_refresh_token'); }
@@ -676,12 +710,35 @@ async function uploadVideo() {
   }
 }
 
+// Pulls the file id out of any of Drive's common share-link shapes:
+//   .../file/d/FILEID/view?usp=sharing   .../open?id=FILEID   .../d/FILEID
+function extractDriveFileId_(url) {
+  const patterns = [/\/d\/([a-zA-Z0-9_-]{10,})/, /[?&]id=([a-zA-Z0-9_-]{10,})/];
+  for (const re of patterns) {
+    const m = url.match(re);
+    if (m) return m[1];
+  }
+  return null;
+}
+
 async function addVideoByLink() {
   const title = document.getElementById('video-title')?.value.trim();
   const link = document.getElementById('video-link')?.value.trim();
   if (!currentVideosUnitId) return;
   if (!title) { toast('❌ اكتب عنوان الفيديو'); return; }
   if (!link) { toast('❌ الصق رابط الفيديو'); return; }
+  // BUG FIX: this used to save whatever URL was pasted as-is. A normal
+  // Drive "copy link" share URL looks like
+  // .../file/d/FILEID/view?usp=sharing — that's the full-page viewer,
+  // and Google actively refuses to let it load inside an <iframe> (shows
+  // a permission-style error) no matter how the file is shared. Only
+  // the special .../file/d/FILEID/preview form is embeddable. This is
+  // exactly what addPresentationByLink already does correctly below —
+  // videos just never got the same treatment. Extracting the file ID
+  // and rebuilding the canonical preview URL here fixes every video
+  // added by link from now on.
+  const driveFileId = extractDriveFileId_(link);
+  const driveUrl = driveFileId ? ('https://drive.google.com/file/d/' + driveFileId + '/preview') : link;
   try {
     const res = await api('/videos', {
       method: 'POST',
@@ -689,7 +746,8 @@ async function addVideoByLink() {
         unitId: currentVideosUnitId,
         lessonId: document.getElementById('video-lesson-select')?.value || '',
         title,
-        driveUrl: link
+        driveFileId: driveFileId || '',
+        driveUrl
       })
     });
     if (res && res.ok) {
@@ -1041,17 +1099,6 @@ function setPresMode(mode) {
   document.getElementById('pres-mode-link-btn').className = 'btn btn-sm ' + (mode === 'link' ? 'btn-primary' : 'btn-secondary');
 }
 
-// Pulls the file id out of any of Drive's common share-link shapes:
-//   .../file/d/FILEID/view?usp=sharing   .../open?id=FILEID   .../d/FILEID
-function extractDriveFileId_(url) {
-  const patterns = [/\/d\/([a-zA-Z0-9_-]{10,})/, /[?&]id=([a-zA-Z0-9_-]{10,})/];
-  for (const re of patterns) {
-    const m = url.match(re);
-    if (m) return m[1];
-  }
-  return null;
-}
-
 // Dropbox share links default to a preview page (?dl=0). Forcing dl=1 (or
 // raw=1) makes Dropbox serve the actual file bytes directly, no interstitial
 // page, no file-size cutoff like Drive's virus-scan warning — this is what
@@ -1154,12 +1201,22 @@ async function uploadPresentation() {
     const uploadData = await uploadRes.json();
     if (!uploadData.ok) { toast('❌ ' + (uploadData.error || 'فشل رفع الملف')); return; }
 
+    // Prefer the converted Google Slides embed URL when the backend
+    // managed to create one (see DriveUpload.gs) — it renders with
+    // Slides' own real next/previous slide arrows and works reliably on
+    // both desktop and phone, unlike Drive's generic file-preview pane
+    // which just shows a static, non-paging view for Office files.
+    // Falls back to the regular file preview if conversion wasn't
+    // available (e.g. the Advanced Drive API isn't enabled on the
+    // Apps Script project) — the presentation still works either way.
+    const embedUrl = uploadData.data.slidesEmbedUrl || uploadData.data.previewUrl || uploadData.data.driveUrl;
+
     const created = await api('/presentations', {
       method: 'POST',
       body: JSON.stringify({
         unitId, title,
         driveFileId: uploadData.data.driveFileId,
-        driveUrl: uploadData.data.previewUrl || uploadData.data.driveUrl
+        driveUrl: embedUrl
       })
     });
     if (created.ok) {
